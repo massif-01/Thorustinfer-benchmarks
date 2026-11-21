@@ -1,0 +1,396 @@
+"""Run the fixed Mini-Weka protocol against an existing service, with a wall limit.
+
+The service owns the GPU lock. This client never deploys or reconfigures it.
+An interrupted run retains diagnostics and cannot qualify as a benchmark score.
+The wall limit starts at request issue, excluding CLI initialization. Paired
+fresh services use the same source-derived benchmark ID and cache-bust inputs.
+Periodic memory sampling uses proc/status; PSS is collected before replay so
+walking a large model's page tables does not stall its timed work.
+"""
+
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import tempfile
+import time
+import urllib.request
+
+from thorustinfer_benchmarks.files import atomic_json, file_hash
+
+
+def command(args):
+    return [
+        str(args.harness.parent / "python"),
+        str(Path(__file__).with_name("agentx_entry.py")),
+        "--harness",
+        str(args.harness),
+        "--benchmark-id",
+        args.benchmark_id,
+        "profile",
+        "--url",
+        args.url,
+        "--endpoint",
+        "/v1/chat/completions",
+        "--model",
+        args.model,
+        "--tokenizer",
+        str(args.tokenizer),
+        "--input-file",
+        str(args.dataset),
+        "--custom-dataset-type",
+        "weka-trace",
+        "--trajectory-start-min-ratio",
+        "0",
+        "--trajectory-start-max-ratio",
+        "0",
+        "--burst-phase-starts",
+        "--trace-idle-gap-cap-seconds",
+        "2",
+        "--system-idle-gap-cap-seconds",
+        "1",
+        "--inter-turn-delay-cap-seconds",
+        "1",
+        "--max-context-length",
+        "262144",
+        "--request-count",
+        str(args.request_count),
+        "--concurrency",
+        str(args.concurrency),
+        "--random-seed",
+        "42",
+        "--warmup-requests-per-lane",
+        "1",
+        "--benchmark-duration",
+        str(args.benchmark_duration),
+        "--benchmark-grace-period",
+        "600",
+        "--request-timeout-seconds",
+        "1800",
+        "--extra-inputs",
+        json.dumps(
+            dict(
+                temperature=args.temperature,
+                top_p=args.top_p,
+                seed=args.sampling_seed,
+                **(
+                    {
+                        "reasoning_effort": "high",
+                        "chat_template_kwargs": {"enable_thinking": True},
+                    }
+                    if args.enable_thinking
+                    else {}
+                ),
+            ),
+            separators=(",", ":"),
+        ),
+        "--export-level",
+        "raw",
+        "--server-metrics-formats",
+        "json",
+        "jsonl",
+        "--ui",
+        "simple",
+        "--output-artifact-dir",
+        str(args.output),
+        "--unsafe-override",
+    ]
+
+
+def fetch(url):
+    with urllib.request.urlopen(url, timeout=3) as response:
+        return response.read().decode()
+
+
+def first_credit_ns(directory):
+    """The first completed record exposes request issue time, excluding CLI startup."""
+    try:
+        with (directory / "profile_export.jsonl").open() as file:
+            line = next(file, "")
+        return json.loads(line)["metadata"]["credit_issued_ns"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def metric_total(metrics, name):
+    return sum(
+        float(line.split()[1])
+        for line in metrics.splitlines()
+        if re.match(re.escape(name) + r"(?:\{|\s)", line)
+    )
+
+
+def snapshot(args, model_info=None):
+    metrics = fetch(args.url + "/metrics")
+    if args.backend == "thorustinfer":
+        return json.loads(fetch(args.url + "/health")), metrics
+    fetch(args.url + "/health")
+    if model_info is None:
+        models = json.loads(fetch(args.url + "/v1/models"))["data"]
+        model_info = next(m for m in models if m["id"] == args.model)
+    return dict(
+        status="ready",
+        failure=None,
+        model=args.model,
+        max_context=model_info.get("max_model_len", 0),
+        backend="vllm",
+        active_requests=int(metric_total(metrics, "vllm:num_requests_running")),
+        queued_requests=int(metric_total(metrics, "vllm:num_requests_waiting")),
+    ), metrics
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("harness", "tokenizer", "dataset", "manifest", "service-model", "output"):
+        parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--url", default="http://127.0.0.1:18818")
+    parser.add_argument("--model", default="deepseek-v41-flash-1017-w4a8")
+    parser.add_argument("--backend", choices=("thorustinfer", "vllm"), default="thorustinfer")
+    parser.add_argument(
+        "--deployment-spec", type=Path, help="Recorded reference server configuration"
+    )
+    parser.add_argument("--service-pid", type=int, required=True)
+    parser.add_argument("--wall-limit", type=int, default=900)
+    parser.add_argument("--request-count", type=int, default=64)
+    parser.add_argument("--concurrency", type=int, default=16)
+    parser.add_argument("--benchmark-duration", type=int, default=180)
+    parser.add_argument(
+        "--benchmark-id", help="Fixed cache-bust identity; defaults to source identity"
+    )
+    parser.add_argument("--mtp-drafts", type=int, default=0, help="Expected service draft limit")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--sampling-seed",
+        type=int,
+        default=20261002,
+        help="Model sampling seed; trace order still uses seed 42",
+    )
+    parser.add_argument(
+        "--enable-thinking", action="store_true", help="Enable thinking for all replay requests"
+    )
+    args = parser.parse_args()
+    if not 60 <= args.wall_limit <= 1200:
+        parser.error("Mini diagnostics require a 60..1200 second wall limit")
+    if min(args.request_count, args.concurrency, args.benchmark_duration) < 1:
+        parser.error("Replay count, concurrency and duration must be positive")
+    if not (0 <= args.temperature <= 2 and 0 < args.top_p <= 1):
+        parser.error("Require temperature in 0..2 and top_p in (0,1]")
+    args.url = args.url.rstrip("/")
+    model_info = None
+    deployment = None
+    if args.backend == "vllm":
+        if args.deployment_spec is None:
+            parser.error("vLLM requires --deployment-spec to record DSpark and context settings")
+        deployment = json.loads(args.deployment_spec.read_text())
+        if (
+            deployment["method"] != "dspark"
+            or deployment["num_speculative_tokens"] != args.mtp_drafts
+        ):
+            raise ValueError("Reference DSpark configuration differs from --mtp-drafts")
+        models = json.loads(fetch(args.url + "/v1/models"))["data"]
+        model_info = next(m for m in models if m["id"] == args.model)
+    health, _ = snapshot(args, model_info)
+    if health["status"] != "ready" or health["model"] != args.model:
+        raise ValueError("The selected service is not ready for this model")
+    if (
+        health["max_context"] < 262144
+        or args.mtp_drafts < 0
+        or args.backend == "thorustinfer"
+        and (
+            health["mtp"]["max_drafts"] != args.mtp_drafts
+            or health["mtp"]["enabled"] != (args.mtp_drafts > 0)
+        )
+    ):
+        raise ValueError("Require 262K context and the selected --mtp-drafts limit")
+    if health["active_requests"] or health["queued_requests"]:
+        raise ValueError("Start the Mini replay with an idle service")
+    process = Path("/proc") / str(args.service_pid)
+    executable = process / "exe"
+    service_command = (process / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+    service_environment = dict.fromkeys(
+        (
+            "THORUSTINFER_A2_HOST_TABLE_MIB",
+            "THORUSTINFER_A2_HOST_ROW_CACHE_MIB",
+            "THORUSTINFER_A2_WORKER_CPUS",
+            "THORUSTINFER_HOST_ROW_CACHE_REPORT",
+            "HCCL_OP_EXPANSION_MODE",
+            "HCCL_DETERMINISTIC",
+            "HCCL_NPU_SOCKET_PORT_RANGE",
+        )
+    )
+    for entry in (process / "environ").read_bytes().split(b"\0"):
+        key, _, value = entry.partition(b"=")
+        name = key.decode(errors="replace")
+        if name in service_environment:
+            service_environment[name] = value.decode(errors="replace")
+    if "serve " not in service_command:
+        raise ValueError("The recorded service PID is not a serve process")
+    manifest = json.loads(args.manifest.read_text())
+    inputs = {}
+    for window in manifest["windows"]:
+        name = window["trace"] + ".json"
+        digest = file_hash(args.dataset / name)
+        if digest != window["sha256"]:
+            raise ValueError("Mini source window differs: " + name)
+        inputs[name] = digest
+    if len(inputs) != 16:
+        raise ValueError("Require the sixteen original Mini windows")
+    input_identity = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    args.benchmark_id = args.benchmark_id or "thorustinfer-mini-" + input_identity[:16]
+    args.output.mkdir(parents=True, exist_ok=False)
+    lock = args.output.parent / "agentx-mini.lock"
+    with lock.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        environment = os.environ.copy()
+        environment.update(
+            TOKENIZERS_PARALLELISM="false",
+            OMP_NUM_THREADS="1",
+            HF_DATASETS_OFFLINE="1",
+            AIPERF_DATASET_WEKA_PARALLEL_WORKERS="16",
+        )
+        cache = Path(environment.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+        environment.setdefault("HF_HOME", str(cache / "huggingface"))
+        environment.setdefault("AIPERF_DATASET_MMAP_CACHE_DIR", str(cache / "agentx-mmap-cache"))
+        # Leave room for ZMQ's IPC suffix under the 107-byte sun_path limit.
+        temporary = tempfile.TemporaryDirectory(prefix="ori-mini-", dir="/tmp")
+        environment["TMPDIR"] = temporary.name
+        invocation = command(args)
+        memory_start = time.monotonic()
+        (args.output / "memory-before.txt").write_text((process / "smaps_rollup").read_text())
+        memory_before_s = time.monotonic() - memory_start
+        provenance = dict(
+            started_at=datetime.datetime.now().astimezone().isoformat(),
+            command=invocation,
+            wall_limit_s=args.wall_limit,
+            backend=args.backend,
+            deployment=deployment,
+            request_count=args.request_count,
+            concurrency=args.concurrency,
+            benchmark_duration_s=args.benchmark_duration,
+            wall_limit_basis="first_request_credit",
+            benchmark_id=args.benchmark_id,
+            mtp_drafts=args.mtp_drafts,
+            enable_thinking=args.enable_thinking,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            sampling_seed=args.sampling_seed,
+            service_pid=args.service_pid,
+            service_command=service_command,
+            service_environment=service_environment,
+            periodic_memory_source="proc/status",
+            memory_before_s=memory_before_s,
+            service_binary_sha256=file_hash(executable),
+            service_model_sha256=file_hash(
+                args.service_model
+                / ("cache/model.json" if args.backend == "thorustinfer" else "config.json")
+            ),
+            manifest_sha256=file_hash(args.manifest),
+            inputs=inputs,
+            input_identity=input_identity,
+            health_before=health,
+            scope="Fixed Mini-Weka tuning surrogate; interrupted runs have no accepted score",
+        )
+        atomic_json(args.output / "provenance.json", provenance)
+        (args.output / "metrics-before.txt").write_text(fetch(args.url + "/metrics"))
+        start = time.monotonic()
+        start_wall = time.time()
+        limited = False
+        first_request_ns = None
+        with (
+            (args.output / "console.log").open("w") as console,
+            (args.output / "service-samples.jsonl").open("w") as samples,
+        ):
+            child = subprocess.Popen(
+                invocation,
+                stdout=console,
+                stderr=subprocess.STDOUT,
+                env=environment,
+                start_new_session=True,
+            )
+            try:
+                while child.poll() is None:
+                    elapsed = time.monotonic() - start
+                    first_request_ns = first_request_ns or first_credit_ns(args.output)
+                    request_elapsed = (
+                        time.time() - first_request_ns / 1e9 if first_request_ns else None
+                    )
+                    if request_elapsed is not None and request_elapsed >= args.wall_limit:
+                        limited = True
+                        os.killpg(child.pid, signal.SIGTERM)
+                        break
+                    if first_request_ns is None and elapsed >= 120:
+                        raise TimeoutError("AgentX issued no completed request within 120 seconds")
+                    record = dict(
+                        timestamp=time.time(), elapsed_s=elapsed, request_elapsed_s=request_elapsed
+                    )
+                    sample_start = time.monotonic()
+                    try:
+                        record["health"], record["metrics"] = snapshot(args, model_info)
+                        record["memory"] = (process / "status").read_text()
+                        record["process_io"] = (process / "io").read_text()
+                        record["process_stat"] = (process / "stat").read_text()
+                    except (OSError, ValueError) as error:
+                        record["error"] = str(error)
+                    record["observer_s"] = time.monotonic() - sample_start
+                    samples.write(json.dumps(record) + "\n")
+                    samples.flush()
+                    time.sleep(2)
+            finally:
+                if child.poll() is None:
+                    os.killpg(child.pid, signal.SIGTERM)
+                    try:
+                        child.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(child.pid, signal.SIGKILL)
+                status = child.wait()
+        result = dict(exit_code=status, wall_limit_reached=limited, wall_s=time.monotonic() - start)
+        result["first_request_credit_ns"] = first_request_ns
+        if first_request_ns:
+            result["request_wall_s"] = time.time() - first_request_ns / 1e9
+            result["client_initialization_s"] = first_request_ns / 1e9 - start_wall
+        try:
+            rows = [
+                json.loads(line)
+                for line in (args.output / "profile_export.jsonl").read_text().splitlines()
+                if line
+            ]
+            profiled = [r for r in rows if r["metadata"]["benchmark_phase"] == "profiling"]
+            result["profiled_requests"] = len(profiled)
+            result["returned_errors"] = sum(bool(r.get("error")) for r in rows)
+            formal = json.loads((args.output / "profile_export_aiperf.json").read_text())
+            complete = (
+                len(profiled) == args.request_count
+                and all(
+                    not row.get("error")
+                    and not row["metadata"].get("was_cancelled")
+                    and not row["metadata"].get("context_overflow_skip")
+                    for row in profiled
+                )
+                and formal.get("was_cancelled") is False
+            )
+        except (OSError, ValueError, KeyError) as error:
+            complete = False
+            result["validation_error"] = str(error)
+        result["complete_mini_replay"] = complete and status == 0 and not limited
+        atomic_json(args.output / "runner-result.json", result)
+        try:
+            (args.output / "metrics-after.txt").write_text(fetch(args.url + "/metrics"))
+            after, _ = snapshot(args, model_info)
+            atomic_json(args.output / "health-after.json", after)
+        except OSError as error:
+            (args.output / "service-after-error.txt").write_text(str(error))
+        print(json.dumps(result), flush=True)
+        temporary.cleanup()
+        if not result["complete_mini_replay"]:
+            raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
